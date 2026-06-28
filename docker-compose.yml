@@ -1,0 +1,144 @@
+version: '3.8'
+
+services:
+
+  # ─────────────────────────────────────────────
+  # ZOOKEEPER
+  # Kafka needs Zookeeper to manage cluster metadata,
+  # leader election, and broker registration.
+  # Think of it as Kafka's coordinator / registry.
+  # ─────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181   # port Kafka uses to talk to Zookeeper
+      ZOOKEEPER_TICK_TIME: 2000     # heartbeat interval in milliseconds
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─────────────────────────────────────────────
+  # KAFKA BROKER
+  # The message bus. Producers write events here,
+  # consumers read from here. All 4 services talk to this.
+  # ─────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy   # don't start until Zookeeper is ready
+    ports:
+      - "9092:9092"   # port your Spring Boot apps connect to
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+
+      # LISTENERS — this is the most confusing Kafka config. Explanation:
+      # PLAINTEXT://kafka:29092 → used by OTHER DOCKER CONTAINERS (service-to-service)
+      # PLAINTEXT_HOST://localhost:9092 → used by your LOCAL MACHINE (Spring Boot apps)
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1      # 1 = single broker (fine for dev)
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'        # Kafka auto-creates topics when first used
+      KAFKA_LOG_RETENTION_HOURS: 168                 # keep messages for 7 days
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # ─────────────────────────────────────────────
+  # KAFKA UI (optional but very useful during development)
+  # Browse topics, see messages, monitor consumer groups
+  # Access at http://localhost:8080
+  # ─────────────────────────────────────────────
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      - kafka
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092   # uses internal docker network
+
+  # ─────────────────────────────────────────────
+  # POSTGRESQL
+  # Shared database server. Each service gets its own
+  # logical database (orderdb, paymentdb, inventorydb).
+  # In production, each service would have its own DB server —
+  # but one server with multiple databases is fine for local dev.
+  # ─────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: orderdb   # default database created automatically
+    volumes:
+      - postgres_data:/var/lib/postgresql/data   # persist data across restarts
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql   # runs on first start
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─────────────────────────────────────────────
+  # REDIS
+  # Used for idempotency keys.
+  # Payment Service and Inventory Service check Redis
+  # before processing an event to avoid duplicates.
+  # ─────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes   # enable persistence
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─────────────────────────────────────────────
+  # PROMETHEUS
+  # Scrapes /actuator/prometheus from all 4 services
+  # every 15 seconds and stores the metrics.
+  # Access at http://localhost:9090
+  # ─────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml   # config file we'll create next
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=7d'   # keep 7 days of metrics
+
+# Named volumes — Docker manages where these live on your machine
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
