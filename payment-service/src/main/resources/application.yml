@@ -23,7 +23,10 @@ spring:
     bootstrap-servers: localhost:9092
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      # StringSerializer — this KafkaTemplate is used by DeadLetterPublishingRecoverer
+      # to republish the original (already-String) record value to the DLQ topic.
+      # JsonSerializer would double-encode it, same bug as order-service's producer.
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
     consumer:
       group-id: payment-service-group
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer

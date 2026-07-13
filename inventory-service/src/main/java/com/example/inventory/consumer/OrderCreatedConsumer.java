@@ -30,13 +30,13 @@ public class OrderCreatedConsumer {
     public void onOrderCreated(String payload) throws Exception {
         OrderCreatedEvent event = objectMapper.readValue(payload, OrderCreatedEvent.class);
 
-        // Idempotency guard: eventId key claimed atomically in Redis.
-        // If another instance (or a redelivery) already claimed it, skip processing.
+        // Idempotency guard: only skip if a PRIOR attempt fully succeeded. The key is
+        // set at the end, after processing — not here — so that a retry (the error
+        // handler re-invokes this method with the same record after a failure) still
+        // sees no key and actually retries, instead of being silently swallowed as a
+        // "duplicate" before it ever reaches the DLQ.
         String idempotencyKey = IDEMPOTENCY_KEY_PREFIX + event.getEventId();
-        Boolean firstSeen = redisTemplate.opsForValue()
-                .setIfAbsent(idempotencyKey, "1", IDEMPOTENCY_TTL);
-
-        if (Boolean.FALSE.equals(firstSeen)) {
+        if (Boolean.TRUE.equals(redisTemplate.hasKey(idempotencyKey))) {
             log.info("[OrderCreatedConsumer] Duplicate delivery, skipping: eventId={}, orderId={}",
                     event.getEventId(), event.getOrderId());
             return;
@@ -55,6 +55,9 @@ public class OrderCreatedConsumer {
                 .build();
 
         inventoryDeductionRepository.save(deduction);
+
+        // Only mark as processed once the save has actually succeeded.
+        redisTemplate.opsForValue().set(idempotencyKey, "1", IDEMPOTENCY_TTL);
 
         log.info("[OrderCreatedConsumer] Inventory deducted: deductionId={}, orderId={}, status={}",
                 deduction.getDeductionId(), deduction.getOrderId(), deduction.getStatus());

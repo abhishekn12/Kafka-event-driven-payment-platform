@@ -7,6 +7,11 @@ spring:
 
   kafka:
     bootstrap-servers: localhost:9092
+    # This service never produced anything before — now needed so
+    # DeadLetterPublishingRecoverer has a KafkaTemplate to publish to the DLQ topic.
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
     consumer:
       group-id: notification-service-group
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
