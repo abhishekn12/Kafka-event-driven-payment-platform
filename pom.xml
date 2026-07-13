@@ -113,13 +113,6 @@
                 <scope>provided</scope> <!-- only needed at compile time -->
             </dependency>
 
-            <!-- Jackson: JSON serialization/deserialization for Kafka messages -->
-            <dependency>
-                <groupId>com.fasterxml.jackson.core</groupId>
-                <artifactId>jackson-databind</artifactId>
-                <version>2.17.1</version>
-            </dependency>
-
             <!-- Spring Boot Test: JUnit + Mockito for unit tests -->
             <dependency>
                 <groupId>org.springframework.boot</groupId>

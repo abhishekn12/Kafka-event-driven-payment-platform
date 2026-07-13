@@ -25,7 +25,10 @@ spring:
     bootstrap-servers: localhost:9092
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      # StringSerializer, not JsonSerializer — OutboxPoller already hands us a JSON string
+      # (serialized once via ObjectMapper in OrderService). JsonSerializer would re-encode
+      # that string, double-wrapping it in quotes on the wire.
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
     consumer:
       group-id: order-service-group
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
