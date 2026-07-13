@@ -19,7 +19,7 @@ import java.time.LocalDateTime;
 @Slf4j
 public class OrderCreatedConsumer {
 
-    private static final String IDEMPOTENCY_KEY_PREFIX = "payment:processed-event:";
+    private static final String IDEMPOTENCY_KEY_PREFIX = "payment:processed-order:";
     private static final Duration IDEMPOTENCY_TTL = Duration.ofHours(24);
 
     private final PaymentRepository paymentRepository;
@@ -30,14 +30,17 @@ public class OrderCreatedConsumer {
     public void onOrderCreated(String payload) throws Exception {
         OrderCreatedEvent event = objectMapper.readValue(payload, OrderCreatedEvent.class);
 
-        // Idempotency guard: only skip if a PRIOR attempt fully succeeded. The key is
-        // set at the end, after processing — not here — so that a retry (the error
-        // handler re-invokes this method with the same record after a failure) still
-        // sees no key and actually retries, instead of being silently swallowed as a
-        // "duplicate" before it ever reaches the DLQ.
-        String idempotencyKey = IDEMPOTENCY_KEY_PREFIX + event.getEventId();
+        // Idempotency guard keyed on orderId, not eventId: this protects against ANY
+        // duplicate payment for the same order — not just redelivery of the same Kafka
+        // message, but also a second, distinct OrderCreated event that references an
+        // order we already charged (e.g. a bug upstream). eventId-based dedup would miss
+        // that case. Key is set at the end, after processing succeeds — not here — so
+        // that a retry (the error handler re-invokes this method with the same record
+        // after a failure) still sees no key and actually retries, instead of being
+        // silently swallowed as a "duplicate" before it ever reaches the DLQ.
+        String idempotencyKey = IDEMPOTENCY_KEY_PREFIX + event.getOrderId();
         if (Boolean.TRUE.equals(redisTemplate.hasKey(idempotencyKey))) {
-            log.info("[OrderCreatedConsumer] Duplicate delivery, skipping: eventId={}, orderId={}",
+            log.info("[OrderCreatedConsumer] Duplicate order, skipping: eventId={}, orderId={}",
                     event.getEventId(), event.getOrderId());
             return;
         }
