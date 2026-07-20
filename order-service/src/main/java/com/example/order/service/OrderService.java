@@ -2,6 +2,7 @@ package com.example.order.service;
 
 import com.example.order.dto.CreateOrderRequest;
 import com.example.order.dto.CreateOrderResponse;
+import com.example.order.dto.OrderCancelledEvent;
 import com.example.order.dto.OrderCreatedEvent;
 import com.example.order.entity.Order;
 import com.example.order.entity.OrderStatus;
@@ -88,5 +89,78 @@ public class OrderService {
                 .status(OrderStatus.PENDING)
                 .message("Order accepted. Processing initiated.")
                 .build();
+    }
+
+    // Saga happy-path terminal state, triggered by InventoryUpdated.
+    // Guarded to only apply PENDING -> CONFIRMED: if the order is already in a
+    // terminal state (e.g. a retry redelivers this after we already transitioned),
+    // skip rather than overwrite. This is what makes the transition idempotent
+    // without needing a separate Redis dedup layer like payment/inventory have.
+    @Transactional
+    public void confirmOrder(String orderId) {
+        Order order = orderRepository.findById(orderId).orElse(null);
+        if (order == null) {
+            log.error("[OrderService] Cannot confirm — order not found: orderId={}", orderId);
+            return;
+        }
+        if (order.getStatus() != OrderStatus.PENDING) {
+            log.info("[OrderService] Order already in terminal state, skipping confirm: orderId={}, status={}",
+                    orderId, order.getStatus());
+            return;
+        }
+
+        order.setStatus(OrderStatus.CONFIRMED);
+        orderRepository.save(order);
+        log.info("[OrderService] Order confirmed: orderId={}", orderId);
+    }
+
+    // Saga compensation, triggered by PaymentFailed or InventoryFailed.
+    // Same PENDING-only guard as confirmOrder. Writes the order.cancelled outbox
+    // event in the SAME transaction as the status flip — unlike payment/inventory's
+    // consumers (which publish directly after their DB save, and so need a
+    // find-or-create recovery path for the gap between the two), this reuses the
+    // existing transactional-outbox guarantee: a retry either did both the status
+    // update and the outbox write, or neither.
+    @Transactional
+    public void cancelOrder(String orderId, String reason) {
+        Order order = orderRepository.findById(orderId).orElse(null);
+        if (order == null) {
+            log.error("[OrderService] Cannot cancel — order not found: orderId={}", orderId);
+            return;
+        }
+        if (order.getStatus() != OrderStatus.PENDING) {
+            log.info("[OrderService] Order already in terminal state, skipping cancel: orderId={}, status={}",
+                    orderId, order.getStatus());
+            return;
+        }
+
+        order.setStatus(OrderStatus.CANCELLED);
+        orderRepository.save(order);
+
+        OrderCancelledEvent event = OrderCancelledEvent.builder()
+                .eventId(UUID.randomUUID().toString())
+                .orderId(orderId)
+                .reason(reason)
+                .occurredAt(LocalDateTime.now())
+                .build();
+
+        String payload;
+        try {
+            payload = objectMapper.writeValueAsString(event);
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException("Failed to serialize OrderCancelledEvent", e);
+        }
+
+        OutboxEvent outboxEvent = OutboxEvent.builder()
+                .eventId(event.getEventId())
+                .topic("order.cancelled")
+                .aggregateId(orderId)
+                .payload(payload)
+                .published(false)
+                .createdAt(LocalDateTime.now())
+                .build();
+
+        outboxEventRepository.save(outboxEvent);
+        log.info("[OrderService] Order cancelled: orderId={}, reason={}", orderId, reason);
     }
 }

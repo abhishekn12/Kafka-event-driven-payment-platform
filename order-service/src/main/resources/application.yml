@@ -32,10 +32,10 @@ spring:
     consumer:
       group-id: order-service-group
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      # StringDeserializer, not JsonDeserializer — payment/inventory-service publish raw
+      # JSON strings (no __TypeId__ header), so we deserialize manually in each listener.
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       auto-offset-reset: earliest   # if no offset saved, start from beginning of topic
-      properties:
-        spring.json.trusted.packages: "*"   # trust all packages for deserialization
 
 # Expose all actuator endpoints (health, metrics, prometheus)
 management:
