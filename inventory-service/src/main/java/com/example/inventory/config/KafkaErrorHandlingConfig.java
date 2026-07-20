@@ -1,6 +1,9 @@
 package com.example.inventory.config;
 
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.common.TopicPartition;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -8,16 +11,18 @@ import org.springframework.kafka.config.TopicBuilder;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
 import org.springframework.kafka.listener.DefaultErrorHandler;
+import org.springframework.kafka.listener.RetryListener;
 import org.springframework.kafka.support.ExponentialBackOffWithMaxRetries;
 
 @Configuration
 public class KafkaErrorHandlingConfig {
 
-    // Per-service DLQ, not Spring's default "<topic>.DLT" — payment, inventory, and
-    // notification are three independent consumer groups on order.created and fail
-    // independently. A shared .DLT topic would mix failures from all three together
-    // and you'd lose which service actually failed to process a given message.
-    private static final String DLQ_TOPIC = "order.created.dlq.inventory-service";
+    // Per-service DLQ, not Spring's default "<topic>.DLT" — each consuming service
+    // fails independently, and a shared .DLT topic would mix failures together and
+    // lose which service actually failed. Named after payment.processed, not
+    // order.created — inventory's trigger event changed with the saga (see
+    // SAGA_DESIGN.md): it now only runs after payment succeeds.
+    private static final String DLQ_TOPIC = "payment.processed.dlq.inventory-service";
 
     @Bean
     public NewTopic inventoryDlqTopic() {
@@ -28,7 +33,8 @@ public class KafkaErrorHandlingConfig {
     }
 
     @Bean
-    public DefaultErrorHandler kafkaErrorHandler(KafkaTemplate<String, String> kafkaTemplate) {
+    public DefaultErrorHandler kafkaErrorHandler(KafkaTemplate<String, String> kafkaTemplate,
+                                                  MeterRegistry meterRegistry) {
         DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(
                 kafkaTemplate,
                 (record, ex) -> new TopicPartition(DLQ_TOPIC, -1));  // -1 = let Kafka pick the partition
@@ -41,6 +47,33 @@ public class KafkaErrorHandlingConfig {
         backOff.setMultiplier(2.0);
         backOff.setMaxInterval(10_000L);
 
-        return new DefaultErrorHandler(recoverer, backOff);
+        DefaultErrorHandler errorHandler = new DefaultErrorHandler(recoverer, backOff);
+        errorHandler.setRetryListeners(retryMetricsListener(meterRegistry));
+        return errorHandler;
+    }
+
+    private RetryListener retryMetricsListener(MeterRegistry meterRegistry) {
+        Counter retryCounter = Counter.builder("kafka.consumer.retry")
+                .description("Kafka listener retry attempts")
+                .tag("service", "inventory-service")
+                .register(meterRegistry);
+        Counter dlqCounter = Counter.builder("kafka.consumer.dlq")
+                .description("Records recovered to the DLQ after exhausting retries")
+                .tag("service", "inventory-service")
+                .register(meterRegistry);
+
+        return new RetryListener() {
+            @Override
+            public void failedDelivery(ConsumerRecord<?, ?> record, Exception ex, int deliveryAttempt) {
+                if (deliveryAttempt > 1) {
+                    retryCounter.increment();
+                }
+            }
+
+            @Override
+            public void recovered(ConsumerRecord<?, ?> record, Exception ex) {
+                dlqCounter.increment();
+            }
+        };
     }
 }
