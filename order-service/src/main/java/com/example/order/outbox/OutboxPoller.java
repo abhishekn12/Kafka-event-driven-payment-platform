@@ -4,6 +4,7 @@ import com.example.order.entity.OutboxEvent;
 import com.example.order.repository.OutboxEventRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -38,6 +39,10 @@ public class OutboxPoller {
         log.info("[OutboxPoller] Found {} unpublished event(s)", unpublishedEvents.size());
 
         for (OutboxEvent event : unpublishedEvents) {
+            // aggregateId is the orderId for every event this poller handles — set per
+            // iteration (one batch can span multiple orders) and cleared after, so it
+            // never leaks onto the next event in this same loop.
+            MDC.put("orderId", event.getAggregateId());
             try {
                 // Send to Kafka synchronously (get() blocks until broker confirms)
                 // Key = orderId: ensures all events for the same order go to the same partition
@@ -57,6 +62,8 @@ public class OutboxPoller {
                 log.error("[OutboxPoller] Failed to publish event: eventId={}, error={}",
                         event.getEventId(), e.getMessage());
                 // Don't rethrow — we want to continue processing other events in the batch
+            } finally {
+                MDC.remove("orderId");
             }
         }
     }

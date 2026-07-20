@@ -6,6 +6,7 @@ import com.example.notification.dto.PaymentFailedEvent;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
 
@@ -22,23 +23,38 @@ public class SagaOutcomeConsumer {
     @KafkaListener(topics = "payment.failed")
     public void onPaymentFailed(String payload) throws Exception {
         PaymentFailedEvent event = objectMapper.readValue(payload, PaymentFailedEvent.class);
-        log.info("[SagaOutcomeConsumer] EMAIL stub -> customerId={}: \"Your order {} could not be processed: {}\"",
-                event.getCustomerId(), event.getOrderId(), event.getReason());
+        MDC.put("orderId", event.getOrderId());
+        try {
+            log.info("[SagaOutcomeConsumer] EMAIL stub -> customerId={}: \"Your order {} could not be processed: {}\"",
+                    event.getCustomerId(), event.getOrderId(), event.getReason());
+        } finally {
+            MDC.remove("orderId");
+        }
     }
 
     @KafkaListener(topics = "inventory.failed")
     public void onInventoryFailed(String payload) throws Exception {
         InventoryFailedEvent event = objectMapper.readValue(payload, InventoryFailedEvent.class);
-        log.info("[SagaOutcomeConsumer] EMAIL stub -> customerId={}: \"Your order {} was cancelled: {}\"",
-                event.getCustomerId(), event.getOrderId(), event.getReason());
+        MDC.put("orderId", event.getOrderId());
+        try {
+            log.info("[SagaOutcomeConsumer] EMAIL stub -> customerId={}: \"Your order {} was cancelled: {}\"",
+                    event.getCustomerId(), event.getOrderId(), event.getReason());
+        } finally {
+            MDC.remove("orderId");
+        }
     }
 
     @KafkaListener(topics = "inventory.updated")
     public void onInventoryUpdated(String payload) throws Exception {
         InventoryUpdatedEvent event = objectMapper.readValue(payload, InventoryUpdatedEvent.class);
-        log.info("[SagaOutcomeConsumer] EMAIL stub -> customerId={}: \"Your order {} is confirmed and on its way!\"",
-                event.getCustomerId(), event.getOrderId());
-        log.info("[SagaOutcomeConsumer] SMS stub -> customerId={}: \"Order {} confirmed.\"",
-                event.getCustomerId(), event.getOrderId());
+        MDC.put("orderId", event.getOrderId());
+        try {
+            log.info("[SagaOutcomeConsumer] EMAIL stub -> customerId={}: \"Your order {} is confirmed and on its way!\"",
+                    event.getCustomerId(), event.getOrderId());
+            log.info("[SagaOutcomeConsumer] SMS stub -> customerId={}: \"Order {} confirmed.\"",
+                    event.getCustomerId(), event.getOrderId());
+        } finally {
+            MDC.remove("orderId");
+        }
     }
 }

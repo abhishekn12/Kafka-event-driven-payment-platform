@@ -5,8 +5,10 @@ spring:
   application:
     name: notification-service
 
+  # KAFKA_BOOTSTRAP_SERVERS defaults to localhost:9092 for `mvn spring-boot:run`
+  # local dev; docker-compose overrides it to the container service name.
   kafka:
-    bootstrap-servers: localhost:9092
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     # This service never produced anything before — now needed so
     # DeadLetterPublishingRecoverer has a KafkaTemplate to publish to the DLQ topic.
     producer:
@@ -29,3 +31,9 @@ management:
     export:
       prometheus:
         enabled: true
+
+# See order-service/application.yml for why — same MDC-based correlation ID convention
+# across all four services.
+logging:
+  pattern:
+    console: "%d{yyyy-MM-dd'T'HH:mm:ss.SSS} %5p [%thread] orderId=%X{orderId:-} %-40.40logger{39} : %m%n"

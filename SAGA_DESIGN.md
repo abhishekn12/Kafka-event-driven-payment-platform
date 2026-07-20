@@ -39,9 +39,9 @@ All new topics follow the existing one-topic-per-event-type convention (see `ord
 | `payment.failed` | payment-service | order-service, notification-service | orderId, customerId, amount, paymentId, reason, occurredAt |
 | `inventory.updated` | inventory-service | order-service, notification-service | orderId, customerId, productId, quantity, occurredAt |
 | `inventory.failed` | inventory-service | order-service, notification-service | orderId, customerId, productId, quantity, reason, occurredAt |
-| `order.cancelled` | order-service | notification-service | orderId, reason, occurredAt |
+| `order.cancelled` | order-service | *(none yet)* | orderId, reason, occurredAt |
 
-`order.cancelled`'s topic bean already existed (unused) from day one — it's finally wired up as the compensation event.
+`order.cancelled`'s topic bean already existed (unused) from day one — it's finally wired up as the compensation event. It has no consumers today: notification-service gets its failure notification directly from `payment.failed`/`inventory.failed` instead (more specific — it carries the actual decline reason), so also listening to `order.cancelled` would just be a redundant duplicate notification. It's published for audit purposes and as the natural extension point for a future consumer — e.g. a payment-refund flow reacting to it after an inventory-failure compensation (see below).
 
 ## Compensation
 
