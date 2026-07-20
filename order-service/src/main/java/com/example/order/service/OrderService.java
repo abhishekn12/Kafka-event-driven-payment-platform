@@ -13,6 +13,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -45,50 +46,59 @@ public class OrderService {
                 .createdAt(LocalDateTime.now())
                 .build();
 
-        orderRepository.save(order);
-        log.info("[OrderService] Order saved: orderId={}, customerId={}",
-                order.getOrderId(), order.getCustomerId());
-
-        // 2. Build the event payload
-        OrderCreatedEvent event = OrderCreatedEvent.builder()
-                .eventId(UUID.randomUUID().toString())
-                .orderId(order.getOrderId())
-                .customerId(order.getCustomerId())
-                .productId(order.getProductId())
-                .quantity(order.getQuantity())
-                .amount(order.getAmount())
-                .occurredAt(LocalDateTime.now())
-                .build();
-
-        // 3. Serialize event to JSON string for outbox storage
-        String payload;
+        // Correlation ID for every log line touched by this order, across this whole
+        // method — not just the ones that explicitly interpolate orderId into the
+        // message. Removed in finally so it never leaks onto the next record handled
+        // by this pooled thread.
+        MDC.put("orderId", order.getOrderId());
         try {
-            payload = objectMapper.writeValueAsString(event);
-        } catch (JsonProcessingException e) {
-            throw new RuntimeException("Failed to serialize OrderCreatedEvent", e);
+            orderRepository.save(order);
+            log.info("[OrderService] Order saved: orderId={}, customerId={}",
+                    order.getOrderId(), order.getCustomerId());
+
+            // 2. Build the event payload
+            OrderCreatedEvent event = OrderCreatedEvent.builder()
+                    .eventId(UUID.randomUUID().toString())
+                    .orderId(order.getOrderId())
+                    .customerId(order.getCustomerId())
+                    .productId(order.getProductId())
+                    .quantity(order.getQuantity())
+                    .amount(order.getAmount())
+                    .occurredAt(LocalDateTime.now())
+                    .build();
+
+            // 3. Serialize event to JSON string for outbox storage
+            String payload;
+            try {
+                payload = objectMapper.writeValueAsString(event);
+            } catch (JsonProcessingException e) {
+                throw new RuntimeException("Failed to serialize OrderCreatedEvent", e);
+            }
+
+            // 4. Write outbox event in the SAME transaction as the order save
+            // If Kafka is down right now — doesn't matter. Event is safe in DB.
+            OutboxEvent outboxEvent = OutboxEvent.builder()
+                    .eventId(event.getEventId())
+                    .topic("order.created")
+                    .aggregateId(order.getOrderId())   // used as Kafka message key
+                    .payload(payload)
+                    .published(false)
+                    .createdAt(LocalDateTime.now())
+                    .build();
+
+            outboxEventRepository.save(outboxEvent);
+            log.info("[OrderService] Outbox event saved: eventId={}, topic=order.created",
+                    event.getEventId());
+
+            // 5. Return immediately — don't wait for Kafka publish or payment processing
+            return CreateOrderResponse.builder()
+                    .orderId(order.getOrderId())
+                    .status(OrderStatus.PENDING)
+                    .message("Order accepted. Processing initiated.")
+                    .build();
+        } finally {
+            MDC.remove("orderId");
         }
-
-        // 4. Write outbox event in the SAME transaction as the order save
-        // If Kafka is down right now — doesn't matter. Event is safe in DB.
-        OutboxEvent outboxEvent = OutboxEvent.builder()
-                .eventId(event.getEventId())
-                .topic("order.created")
-                .aggregateId(order.getOrderId())   // used as Kafka message key
-                .payload(payload)
-                .published(false)
-                .createdAt(LocalDateTime.now())
-                .build();
-
-        outboxEventRepository.save(outboxEvent);
-        log.info("[OrderService] Outbox event saved: eventId={}, topic=order.created",
-                event.getEventId());
-
-        // 5. Return immediately — don't wait for Kafka publish or payment processing
-        return CreateOrderResponse.builder()
-                .orderId(order.getOrderId())
-                .status(OrderStatus.PENDING)
-                .message("Order accepted. Processing initiated.")
-                .build();
     }
 
     // Saga happy-path terminal state, triggered by InventoryUpdated.
@@ -96,6 +106,11 @@ public class OrderService {
     // terminal state (e.g. a retry redelivers this after we already transitioned),
     // skip rather than overwrite. This is what makes the transition idempotent
     // without needing a separate Redis dedup layer like payment/inventory have.
+    // MDC is not managed here — this is only ever called from SagaOutcomeConsumer,
+    // which already establishes the orderId correlation context for the whole
+    // listener invocation. Managing it here too would risk this method's own
+    // finally-remove wiping the consumer's still-active context if it logs again
+    // after this call returns.
     @Transactional
     public void confirmOrder(String orderId) {
         Order order = orderRepository.findById(orderId).orElse(null);
@@ -121,6 +136,8 @@ public class OrderService {
     // find-or-create recovery path for the gap between the two), this reuses the
     // existing transactional-outbox guarantee: a retry either did both the status
     // update and the outbox write, or neither.
+    // MDC is not managed here — see confirmOrder for why (only ever called from
+    // SagaOutcomeConsumer, which owns the correlation context for this invocation).
     @Transactional
     public void cancelOrder(String orderId, String reason) {
         Order order = orderRepository.findById(orderId).orElse(null);

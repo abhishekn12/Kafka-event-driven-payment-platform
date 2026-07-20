@@ -12,6 +12,7 @@ import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.core.KafkaTemplate;
@@ -58,51 +59,59 @@ public class PaymentProcessedConsumer {
     public void onPaymentProcessed(String payload) throws Exception {
         PaymentProcessedEvent event = objectMapper.readValue(payload, PaymentProcessedEvent.class);
 
-        // Idempotency guard keyed on orderId, not eventId — see payment-service's
-        // consumer for the full reasoning (protects against any duplicate deduction
-        // for the same order, not just redelivery of the same Kafka message). Key is
-        // set only after publishing succeeds below, not here.
-        String idempotencyKey = IDEMPOTENCY_KEY_PREFIX + event.getOrderId();
-        // hasKey() returns Boolean, not boolean — Boolean.TRUE.equals(...) avoids an
-        // NPE from auto-unboxing if it ever returns null, unlike `if (hasKey(...))`.
-        if (Boolean.TRUE.equals(redisTemplate.hasKey(idempotencyKey))) {
-            log.info("[PaymentProcessedConsumer] Duplicate order, skipping: eventId={}, orderId={}",
-                    event.getEventId(), event.getOrderId());
-            return;
+        // Correlation ID for every log line this record touches, for the rest of this
+        // listener invocation. Removed in finally so it never leaks onto the next
+        // record handled by this pooled thread.
+        MDC.put("orderId", event.getOrderId());
+        try {
+            // Idempotency guard keyed on orderId, not eventId — see payment-service's
+            // consumer for the full reasoning (protects against any duplicate deduction
+            // for the same order, not just redelivery of the same Kafka message). Key is
+            // set only after publishing succeeds below, not here.
+            String idempotencyKey = IDEMPOTENCY_KEY_PREFIX + event.getOrderId();
+            // hasKey() returns Boolean, not boolean — Boolean.TRUE.equals(...) avoids an
+            // NPE from auto-unboxing if it ever returns null, unlike `if (hasKey(...))`.
+            if (Boolean.TRUE.equals(redisTemplate.hasKey(idempotencyKey))) {
+                log.info("[PaymentProcessedConsumer] Duplicate order, skipping: eventId={}, orderId={}",
+                        event.getEventId(), event.getOrderId());
+                return;
+            }
+
+            log.info("[PaymentProcessedConsumer] Received PaymentProcessed: eventId={}, orderId={}, productId={}, quantity={}",
+                    event.getEventId(), event.getOrderId(), event.getProductId(), event.getQuantity());
+
+            // Recovery path: the DB save and the Kafka send below are two separate
+            // operations (no outbox table here). A retry can land here after the save
+            // succeeded but publishing failed. orderId is unique on InventoryDeduction,
+            // so re-inserting would throw and loop forever — reuse the existing row
+            // instead.
+            InventoryDeduction deduction = inventoryDeductionRepository.findByOrderId(event.getOrderId())
+                    .orElseGet(() -> {
+                        boolean declined = event.getQuantity() > DECLINE_ABOVE_QUANTITY;
+                        InventoryDeduction newDeduction = InventoryDeduction.builder()
+                                .orderId(event.getOrderId())
+                                .productId(event.getProductId())
+                                .quantity(event.getQuantity())
+                                .status(declined ? InventoryStatus.FAILED : InventoryStatus.DEDUCTED)
+                                .processedAt(LocalDateTime.now())
+                                .build();
+                        return inventoryDeductionRepository.save(newDeduction);
+                    });
+
+            if (deduction.getStatus() == InventoryStatus.FAILED) {
+                publishInventoryFailed(event, deduction);
+            } else {
+                publishInventoryUpdated(event, deduction);
+            }
+
+            // Only mark as fully processed once publishing has actually succeeded.
+            redisTemplate.opsForValue().set(idempotencyKey, "1", IDEMPOTENCY_TTL);
+
+            log.info("[PaymentProcessedConsumer] Inventory processed: deductionId={}, orderId={}, status={}",
+                    deduction.getDeductionId(), deduction.getOrderId(), deduction.getStatus());
+        } finally {
+            MDC.remove("orderId");
         }
-
-        log.info("[PaymentProcessedConsumer] Received PaymentProcessed: eventId={}, orderId={}, productId={}, quantity={}",
-                event.getEventId(), event.getOrderId(), event.getProductId(), event.getQuantity());
-
-        // Recovery path: the DB save and the Kafka send below are two separate
-        // operations (no outbox table here). A retry can land here after the save
-        // succeeded but publishing failed. orderId is unique on InventoryDeduction,
-        // so re-inserting would throw and loop forever — reuse the existing row
-        // instead.
-        InventoryDeduction deduction = inventoryDeductionRepository.findByOrderId(event.getOrderId())
-                .orElseGet(() -> {
-                    boolean declined = event.getQuantity() > DECLINE_ABOVE_QUANTITY;
-                    InventoryDeduction newDeduction = InventoryDeduction.builder()
-                            .orderId(event.getOrderId())
-                            .productId(event.getProductId())
-                            .quantity(event.getQuantity())
-                            .status(declined ? InventoryStatus.FAILED : InventoryStatus.DEDUCTED)
-                            .processedAt(LocalDateTime.now())
-                            .build();
-                    return inventoryDeductionRepository.save(newDeduction);
-                });
-
-        if (deduction.getStatus() == InventoryStatus.FAILED) {
-            publishInventoryFailed(event, deduction);
-        } else {
-            publishInventoryUpdated(event, deduction);
-        }
-
-        // Only mark as fully processed once publishing has actually succeeded.
-        redisTemplate.opsForValue().set(idempotencyKey, "1", IDEMPOTENCY_TTL);
-
-        log.info("[PaymentProcessedConsumer] Inventory processed: deductionId={}, orderId={}, status={}",
-                deduction.getDeductionId(), deduction.getOrderId(), deduction.getStatus());
     }
 
     private void publishInventoryUpdated(PaymentProcessedEvent event, InventoryDeduction deduction) throws Exception {
